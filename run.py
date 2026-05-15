@@ -28,6 +28,105 @@ from assemble_plan import assemble_plan
 from render_pptx import render
 
 
+def _map_chapter_visuals(
+    ch: dict,
+    figure_entries: list[dict],
+    table_entries: list[dict],
+    chapter_texts: dict[str, str],
+    llm_results: dict[str, dict],
+    provider: str,
+    model_kwargs: dict,
+) -> None:
+    """Recursively process a chapter tree, calling the LLM for each section
+    with the figures and tables that fall within its page range."""
+    from llm_summarize import summarize_chapter
+
+    for label, text in chapter_texts.items():
+        if not text.strip():
+            continue
+
+        # Find figures/tables belonging to this section
+        sec_figures, sec_tables = _find_visuals_for_section(
+            ch, label, figure_entries, table_entries
+        )
+
+        print(f"LLM: {label} ({len(text)} chars", end="")
+        if sec_figures:
+            print(f", {len(sec_figures)} figures", end="")
+        if sec_tables:
+            print(f", {len(sec_tables)} tables", end="")
+        print(")")
+
+        try:
+            result = summarize_chapter(
+                label, text,
+                figures=sec_figures or None,
+                tables=sec_tables or None,
+                provider=provider,
+                **model_kwargs,
+            )
+            llm_results[label] = result
+        except Exception as e:
+            print(f"  [warn] LLM call failed for '{label}': {e}")
+            continue
+
+
+def _find_visuals_for_section(
+    ch: dict,
+    label: str,
+    figure_entries: list[dict],
+    table_entries: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Return (figures, tables) whose doc_page falls within the section's page range."""
+    # Determine the section page range
+    if " / " in label:
+        sec_title = label.split(" / ", 1)[1]
+        # Find the subsection
+        for sec in ch.get("sections", []):
+            if sec["title"] == sec_title:
+                pg_start = sec["page_start"]
+                pg_end = sec["page_end"]
+                break
+        else:
+            pg_start = ch["page_start"]
+            pg_end = ch["page_end"]
+    else:
+        pg_start = ch["page_start"]
+        pg_end = ch["page_end"]
+
+    # offset: doc_page → pdf_0idx is handled inside parse_pdf (the screenshot
+    # filenames already point to the right pages).  We use doc_page + 14 ≈ pdf_0idx
+    # for a typical 15-page front-matter offset.
+    # Since we already have screenshots, we match by checking if the figure/table
+    # belongs to this chapter based on its number prefix (e.g. "图3-1" → chapter 3).
+    ch_num = _extract_chapter_number(ch["title"])
+
+    figs = [
+        {"number": f["number"], "caption": f["caption"], "screenshot": f.get("screenshot", "")}
+        for f in figure_entries
+        if f["number"].startswith(f"图{ch_num}-") or f["number"].startswith(f"图{ch_num}–")
+    ]
+    tabs = [
+        {"number": t["number"], "caption": t["caption"], "screenshot": t.get("screenshot", "")}
+        for t in table_entries
+        if t["number"].startswith(f"表{ch_num}-") or t["number"].startswith(f"表{ch_num}–")
+    ]
+    return figs, tabs
+
+
+def _extract_chapter_number(title: str) -> str:
+    """Extract chapter number from a title like '第一章 绪论' → '一'."""
+    import re
+    m = re.search(r"第([一二三四五六七八九十\d]+)章", title)
+    if not m:
+        return ""
+    num = m.group(1)
+    # Convert Chinese numeral to digit
+    cn_map = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+              "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+    return cn_map.get(num, num)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="PDF thesis → defense PPT auto-generation pipeline",
@@ -96,8 +195,8 @@ def main() -> None:
         )
         print(f"  → {parsed_data['total_pages']} pages, "
               f"{len(parsed_data['chapters'])} chapters, "
-              f"{len(parsed_data['images'])} images, "
-              f"{len(parsed_data['tables'])} tables")
+              f"{len(parsed_data.get('figure_entries', []))} figures, "
+              f"{len(parsed_data.get('table_entries', []))} tables")
 
     if args.stop_at == "parse":
         print("Stopped after parsing.")
@@ -106,40 +205,24 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Step 2: LLM summarization (optional)
     # ------------------------------------------------------------------
-    llm_bullets = {}
+    llm_results: dict[str, dict] = {}  # chapter_label → {bullets, figures, tables}
     if args.llm:
         from llm_summarize import summarize_chapter
-        from parse_pdf import extract_all_chapter_texts
-
-        # Reconstruct chapter tree from parsed data
-        from parse_pdf import Section
-
-        def dict_to_section(d: dict) -> Section:
-            return Section(
-                level=d["level"],
-                title=d["title"],
-                page_start=d["page_start"],
-                page_end=d["page_end"],
-                sections=[dict_to_section(s) for s in d.get("sections", [])],
-            )
-
-        chapters = [dict_to_section(ch) for ch in parsed_data["chapters"]]
-        chapter_texts = extract_all_chapter_texts(args.pdf, chapters)
 
         model_kwargs = {}
         if args.model:
             model_kwargs["model"] = args.model
 
-        for label, text in chapter_texts.items():
-            print(f"LLM summarizing: {label} ({len(text)} chars)")
-            try:
-                bullets = summarize_chapter(
-                    label, text, provider=args.llm, **model_kwargs,
-                )
-                llm_bullets[label] = bullets
-            except Exception as e:
-                print(f"  [warn] LLM call failed for '{label}': {e}")
-                continue
+        # Map figure/table entries to chapters by page range
+        figure_entries = parsed_data.get("figure_entries", [])
+        table_entries = parsed_data.get("table_entries", [])
+        chapter_texts = parsed_data.get("chapter_texts", {})
+
+        for ch in parsed_data.get("chapters", []):
+            _map_chapter_visuals(
+                ch, figure_entries, table_entries, chapter_texts,
+                llm_results, args.llm, model_kwargs,
+            )
 
     # ------------------------------------------------------------------
     # Step 3: Assemble ppt_plan.json
@@ -149,7 +232,7 @@ def main() -> None:
         parsed_data,
         author=args.author,
         date=args.date,
-        llm_bullets=llm_bullets or None,
+        llm_results=llm_results or None,
     )
 
     plan_path = Path("output/ppt_plan.json")

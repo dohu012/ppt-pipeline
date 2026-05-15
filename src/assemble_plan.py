@@ -22,7 +22,7 @@ def assemble_plan(
     *,
     author: str = "",
     date: str = "",
-    llm_bullets: dict[str, list[dict[str, Any]]] | None = None,
+    llm_results: dict[str, dict[str, Any]] | None = None,
     fallback_texts: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a ppt_plan.json document from parsed PDF data.
@@ -31,14 +31,14 @@ def assemble_plan(
         parsed_data: Output of parse_pdf.parse() → .to_dict()
         author: Thesis author name.
         date: Defense date (freeform).
-        llm_bullets: Optional {chapter_title: [{"bullet": ..., "ref_page": ...}]}.
+        llm_results: Optional {chapter_label: {"bullets": [...], "figures": [...], "tables": [...]}}.
         fallback_texts: Optional {chapter_title: raw_text} for rule-based bullets
                         when LLM is not used.
 
     Returns:
         The full ppt_plan.json structure as a dict.
     """
-    llm_bullets = llm_bullets or {}
+    llm_results = llm_results or {}
     fallback_texts = fallback_texts or {}
 
     slides: list[dict[str, Any]] = []
@@ -51,17 +51,7 @@ def assemble_plan(
 
     title = parsed_data.get("title", "毕业论文")
     chapters = parsed_data.get("chapters", [])
-    images = parsed_data.get("images", [])
-    tables = parsed_data.get("tables", [])
-
-    # Index images & tables by page number
-    images_by_page: dict[int, list[dict]] = {}
-    for img in images:
-        images_by_page.setdefault(img["page"], []).append(img)
-
-    tables_by_page: dict[int, list[dict]] = {}
-    for t in tables:
-        tables_by_page.setdefault(t["page"], []).append(t)
+    figure_entries = parsed_data.get("figure_entries", [])
 
     # ---- Title slide ----
     slides.append(
@@ -87,11 +77,16 @@ def assemble_plan(
         }
     )
 
+    # Collect LLM-decided figures and tables for the whole document
+    kept_figures: list[dict[str, Any]] = []
+    kept_tables: list[dict[str, Any]] = []
+    figure_screenshots: dict[str, str] = {
+        f["number"]: f.get("screenshot", "") for f in figure_entries
+    }
+
     # ---- Per-chapter slides ----
     for ch in chapters:
         ch_title = ch["title"]
-        ch_start = ch["page_start"]
-        ch_end = ch["page_end"]
 
         # Section-title slide
         subtitle = (
@@ -111,10 +106,22 @@ def assemble_plan(
         for sec in sections_to_process:
             sec_title = sec["title"]
             lookup_key = f"{ch_title} / {sec_title}"
-            bullets = llm_bullets.get(lookup_key) or llm_bullets.get(sec_title)
+            result = llm_results.get(lookup_key) or llm_results.get(sec_title)
+
+            if result:
+                bullets = result.get("bullets", [])
+                # Accumulate kept figures/tables
+                for fig in result.get("figures", []):
+                    if fig.get("keep"):
+                        fig["screenshot"] = figure_screenshots.get(fig["number"], "")
+                        kept_figures.append(fig)
+                for tab in result.get("tables", []):
+                    if tab.get("keep"):
+                        kept_tables.append(tab)
+            else:
+                bullets = None
 
             if not bullets and fallback_texts.get(lookup_key):
-                # Rule-based fallback: split text into sentences, take first N
                 text = fallback_texts[lookup_key]
                 sentences = re.split(r"[。！？\n]", text)
                 bullets = [
@@ -136,40 +143,36 @@ def assemble_plan(
                     }
                 )
 
-        # Figure slides for this chapter's page range
-        for pg in range(ch_start, ch_end + 1):
-            for img in images_by_page.get(pg, []):
-                slides.append(
-                    {
-                        "id": next_id(),
-                        "layout": "figure",
-                        "chapter": ch_title,
-                        "content": {
-                            "title": f"{ch_title} — 图表 (第{pg + 1}页)",
-                            "image": img["filename"],
-                            "caption": "",
-                        },
-                    }
-                )
+        # Figure & table slides are appended at the end of the chapter
+        # (inserted after all bullet slides for this chapter)
 
-        # Table slides
-        for pg in range(ch_start, ch_end + 1):
-            for tbl in tables_by_page.get(pg, []):
-                slides.append(
-                    {
-                        "id": next_id(),
-                        "layout": "table",
-                        "chapter": ch_title,
-                        "content": {
-                            "title": f"{ch_title} — 表格 (第{pg + 1}页)",
-                            "header": tbl["header"],
-                            "rows": tbl["rows"],
-                        },
-                    }
-                )
+    # ---- LLM-approved figure slides ----
+    for fig in kept_figures:
+        slides.append(
+            {
+                "id": next_id(),
+                "layout": "figure",
+                "content": {
+                    "title": fig.get("caption", fig.get("number", "")),
+                    "image": fig.get("screenshot", ""),
+                    "caption": fig.get("number", ""),
+                },
+            }
+        )
 
-    # ---- Conclusion slide (from last chapter bullets if present) ----
-    # Already handled by per-chapter processing
+    # ---- LLM-approved table slides ----
+    for tab in kept_tables:
+        slides.append(
+            {
+                "id": next_id(),
+                "layout": "table",
+                "content": {
+                    "title": tab.get("caption", tab.get("number", "")),
+                    "header": tab.get("header", []),
+                    "rows": tab.get("rows", []),
+                },
+            }
+        )
 
     # ---- End slide ----
     slides.append(

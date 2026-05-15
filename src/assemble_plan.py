@@ -67,8 +67,9 @@ def assemble_plan(
         }
     )
 
-    # ---- TOC slide ----
-    toc_items = [ch["title"] for ch in chapters]
+    # ---- TOC slide (content chapters only) ----
+    _CHAPTER_PATTERN = re.compile(r"第[一二三四五六七八九十\d]+章")
+    toc_items = [ch["title"] for ch in chapters if _CHAPTER_PATTERN.search(ch["title"])]
     slides.append(
         {
             "id": next_id(),
@@ -77,16 +78,22 @@ def assemble_plan(
         }
     )
 
-    # Collect LLM-decided figures and tables for the whole document
+    # Collect LLM-decided figures and tables, deduplicated by number
     kept_figures: list[dict[str, Any]] = []
     kept_tables: list[dict[str, Any]] = []
+    seen_figures: set[str] = set()
+    seen_tables: set[str] = set()
     figure_screenshots: dict[str, str] = {
         f["number"]: f.get("screenshot", "") for f in figure_entries
     }
 
-    # ---- Per-chapter slides ----
+    # ---- Per-chapter slides (content chapters only, skip front matter) ----
     for ch in chapters:
         ch_title = ch["title"]
+
+        # Skip front matter / references / appendix / acknowledgment
+        if not _CHAPTER_PATTERN.search(ch_title):
+            continue
 
         # Section-title slide
         subtitle = (
@@ -101,35 +108,40 @@ def assemble_plan(
             }
         )
 
-        # Bullet slides: one per (sub)section
-        sections_to_process = ch.get("sections") if ch.get("sections") else [ch]
-        for sec in sections_to_process:
-            sec_title = sec["title"]
-            lookup_key = f"{ch_title} / {sec_title}"
-            result = llm_results.get(lookup_key) or llm_results.get(sec_title)
+        # Use LLM multi-slide result if available
+        result = llm_results.get(ch_title)
 
-            if result:
-                bullets = result.get("bullets", [])
-                # Accumulate kept figures/tables
-                for fig in result.get("figures", []):
-                    if fig.get("keep"):
-                        fig["screenshot"] = figure_screenshots.get(fig["number"], "")
-                        kept_figures.append(fig)
-                for tab in result.get("tables", []):
-                    if tab.get("keep"):
-                        kept_tables.append(tab)
-            else:
-                bullets = None
-
-            if not bullets and fallback_texts.get(lookup_key):
-                text = fallback_texts[lookup_key]
-                sentences = re.split(r"[。！？\n]", text)
-                bullets = [
-                    {"bullet": s.strip(), "ref_page": sec["page_start"] + 1}
-                    for s in sentences
-                    if len(s.strip()) > 10
-                ][:5]
-
+        if result and result.get("slides"):
+            for slide_data in result["slides"]:
+                slides.append(
+                    {
+                        "id": next_id(),
+                        "layout": "bullets",
+                        "chapter": ch_title,
+                        "content": {
+                            "title": slide_data.get("title", ch_title),
+                            "bullets": slide_data.get("bullets", []),
+                        },
+                    }
+                )
+            # Accumulate figure/table decisions (deduplicated by number)
+            for fig in result.get("figures", []):
+                if fig.get("keep") and fig["number"] not in seen_figures:
+                    seen_figures.add(fig["number"])
+                    fig["screenshot"] = figure_screenshots.get(fig["number"], "")
+                    kept_figures.append(fig)
+            for tab in result.get("tables", []):
+                if tab.get("keep") and tab["number"] not in seen_tables:
+                    seen_tables.add(tab["number"])
+                    kept_tables.append(tab)
+        elif fallback_texts.get(ch_title):
+            text = fallback_texts[ch_title]
+            sentences = re.split(r"[。！？\n]", text)
+            bullets = [
+                {"bullet": s.strip(), "ref_page": ch["page_start"] + 1}
+                for s in sentences
+                if len(s.strip()) > 10
+            ][:5]
             if bullets:
                 slides.append(
                     {
@@ -137,14 +149,11 @@ def assemble_plan(
                         "layout": "bullets",
                         "chapter": ch_title,
                         "content": {
-                            "title": sec_title,
+                            "title": ch_title,
                             "bullets": bullets,
                         },
                     }
                 )
-
-        # Figure & table slides are appended at the end of the chapter
-        # (inserted after all bullet slides for this chapter)
 
     # ---- LLM-approved figure slides ----
     for fig in kept_figures:

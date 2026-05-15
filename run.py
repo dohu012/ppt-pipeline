@@ -153,9 +153,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Step 2: LLM summarization (optional)
     # ------------------------------------------------------------------
-    llm_results: dict[str, dict] = {}  # chapter_label → {bullets, figures, tables}
+    llm_results: dict[str, dict] = {}  # chapter_label → {slides, figures, tables}
     if args.llm:
-        from llm_summarize import summarize_chapter
+        from llm_summarize import summarize_chapter_multi
 
         model_kwargs = {}
         if args.model:
@@ -163,44 +163,34 @@ def main() -> None:
         elif os.environ.get("PPT_MODEL"):
             model_kwargs["model"] = os.environ["PPT_MODEL"]
 
-        # Prepare tasks: skip short entries (< 300 chars), send rest to LLM
         figure_entries = parsed_data.get("figure_entries", [])
         table_entries = parsed_data.get("table_entries", [])
         chapter_texts = parsed_data.get("chapter_texts", {})
+
+        # Only process main content chapters (第X章), skip front matter
+        _CHAPTER_PATTERN = re.compile(r"第[一二三四五六七八九十\d]+章")
 
         tasks: list[tuple[str, str, list[dict], list[dict]]] = []
         for label, text in chapter_texts.items():
             if not text.strip():
                 continue
+            # Only include main chapter entries (not subsections, not front matter)
+            if not _CHAPTER_PATTERN.search(label):
+                continue
 
-            # Find which chapter owns this label
-            ch_num = ""
-            for ch in parsed_data.get("chapters", []):
-                if label.startswith(ch["title"]) or label == ch["title"]:
-                    ch_num = _extract_chapter_number(ch["title"])
-                    break
-
+            ch_num = _extract_chapter_number(label)
             sec_figures, sec_tables = _find_visuals_for_section(
                 ch_num, figure_entries, table_entries
             )
-
-            # Short text: skip LLM, use rule-based bullets directly
-            if len(text.strip()) < 300:
-                sentences = [s.strip() for s in re.split(r"[。！？\n]", text) if len(s.strip()) > 10]
-                bullets = [{"bullet": s[:25], "ref_page": 0} for s in sentences[:3]]
-                llm_results[label] = {"bullets": bullets, "figures": [], "tables": []}
-                continue
-
             tasks.append((label, text, sec_figures, sec_tables))
 
-        # Process remaining tasks in parallel
         total = len(tasks)
         if total:
-            print(f"LLM: processing {total} sections (max_workers=5)...")
+            print(f"LLM: summarizing {total} chapters (max_workers=5)...")
             with ThreadPoolExecutor(max_workers=5) as executor:
                 future_map = {
                     executor.submit(
-                        summarize_chapter, label, text,
+                        summarize_chapter_multi, label, text,
                         figures=sec_figures or None,
                         tables=sec_tables or None,
                         provider=args.llm,
@@ -213,13 +203,11 @@ def main() -> None:
                     label = future_map[future]
                     try:
                         llm_results[label] = future.result()
+                        n_slides = len(llm_results[label].get("slides", []))
+                        print(f"  [{done}/{total}] {label} ({n_slides} slides)")
                     except Exception as e:
                         print(f"  [{done}/{total}] ✗ {label}: {e}")
                         continue
-                    sec_count = len(llm_results[label].get("bullets", []))
-                    print(f"  [{done}/{total}] {label} ({sec_count} bullets)")
-
-    # ------------------------------------------------------------------
     # Step 3: Assemble ppt_plan.json
     # ------------------------------------------------------------------
     print("Assembling ppt_plan.json ...")

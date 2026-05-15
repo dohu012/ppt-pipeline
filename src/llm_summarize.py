@@ -99,6 +99,57 @@ _VISION_ITEM = """\
 
 
 # ---------------------------------------------------------------------------
+# Prompts (chapter-level multi-slide)
+# ---------------------------------------------------------------------------
+
+_CHAPTER_SYSTEM = """\
+你是一个答辩PPT制作助手。用户会提供论文某一章的完整内容及该章内图表截图。
+
+请完成两项任务：
+1. 为这一章设计2-4页PPT内容，将整章内容提炼为核心要点
+   - 不要照搬原章节的小节标题，而是按主题重新组织
+   - 每页PPT 3-6条bullet points，每条不超过25字
+   - 保留核心数据指标（百分比、系数、金额等）
+   - 去掉推导过程和方法论细节
+   - 各页之间内容不重复
+   - 使用中文输出
+2. 逐一审视每张图表截图，判断它是否值得放进答辩PPT
+   - 标准：核心结论图、模型框架图、关键数据对比表 → 保留
+   - 太细节的推导图、次要附表、装饰性图表 → 跳过
+
+严格按以下JSON格式输出，不要输出任何其他内容：
+{
+  "slides": [
+    {
+      "title": "本页标题（简短，4-8字）",
+      "bullets": [{"bullet": "...", "ref_page": N}, ...]
+    },
+    ...
+  ],
+  "figures": [
+    {"number": "图X-Y", "keep": true, "caption": "原标题", "reason": "一句话理由"},
+    {"number": "图X-Y", "keep": false, "reason": "一句话理由"}
+  ],
+  "tables": [
+    {"number": "表X-Y", "keep": true, "caption": "原标题", "header": ["列1", "列2"], "rows": [["值1", "值2"]]},
+    {"number": "表X-Y", "keep": false, "reason": "一句话理由"}
+  ]
+}
+
+注意：
+- slides 数组长度2-4
+- figures 数组里必须包含输入中的每一张图（keep true 或 false）
+- tables 数组里必须包含输入中的每一个表（keep true 或 false）
+- 表格数据请逐行逐列仔细抄录，保留所有数字精度"""
+
+_CHAPTER_USER_TEMPLATE = """\
+论文章节：{chapter_title}
+
+完整正文内容：
+{chapter_text}"""
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -124,6 +175,14 @@ def _parse_vision_result(raw: str) -> dict[str, Any]:
         return json.loads(_clean_json(raw))
     except json.JSONDecodeError:
         return {"bullets": [], "figures": [], "tables": []}
+
+
+def _parse_chapter_result(raw: str) -> dict[str, Any]:
+    """Parse multi-slide chapter-level LLM output."""
+    try:
+        return json.loads(_clean_json(raw))
+    except json.JSONDecodeError:
+        return {"slides": [], "figures": [], "tables": []}
 
 
 def _split_text(text: str, max_chars: int) -> list[str]:
@@ -510,3 +569,72 @@ def summarize_chapter(
     # Keep the text-only bullets (already high quality from map-reduce)
     result["bullets"] = bullets
     return result
+
+
+# ---------------------------------------------------------------------------
+# Chapter-level multi-slide summarization
+# ---------------------------------------------------------------------------
+
+def summarize_chapter_multi(
+    chapter_title: str,
+    chapter_text: str,
+    *,
+    figures: list[dict[str, Any]] | None = None,
+    tables: list[dict[str, Any]] | None = None,
+    provider: str = "claude",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Summarize a whole chapter into 2-4 slides + figure/table decisions.
+
+    Returns:
+        ``{"slides": [{"title": str, "bullets": [...]}, ...],
+           "figures": [...], "tables": [...]}``
+    """
+    if not chapter_text.strip() and not figures and not tables:
+        return {"slides": [], "figures": [], "tables": []}
+
+    has_visuals = bool(figures or tables)
+
+    if has_visuals:
+        # Build message with figure/table list + screenshots
+        user_lines = [
+            _CHAPTER_USER_TEMPLATE.format(
+                chapter_title=chapter_title,
+                chapter_text=chapter_text[:10000],
+            ),
+        ]
+
+        idx = 0
+        item_to_source: list[str] = []
+        for fig in (figures or []):
+            idx += 1
+            user_lines.append(_VISION_ITEM.format(idx=idx, number=fig["number"], caption=fig["caption"]))
+            item_to_source.append(fig.get("screenshot", ""))
+        for tab in (tables or []):
+            idx += 1
+            user_lines.append(_VISION_ITEM.format(idx=idx, number=tab["number"], caption=tab["caption"]))
+            item_to_source.append(tab.get("screenshot", ""))
+
+        user_text = "\n".join(user_lines)
+
+        image_blocks: list[dict[str, Any]] = []
+        for path in item_to_source:
+            if path and os.path.isfile(path):
+                try:
+                    image_blocks.append(_encode_image(path))
+                except Exception:
+                    image_blocks.append({"type": "text", "text": "\n[图片无法加载]"})
+
+        vision_caller = _call_claude_vision if provider == "claude" else _call_openai_vision
+        raw = _call_vision_with_retry(
+            vision_caller, _CHAPTER_SYSTEM, user_text, image_blocks, **kwargs,
+        )
+        return _parse_chapter_result(raw)
+    else:
+        caller = _call_claude if provider == "claude" else _call_openai
+        raw = _call_with_retry(
+            caller, _CHAPTER_SYSTEM,
+            _CHAPTER_USER_TEMPLATE.format(chapter_title=chapter_title, chapter_text=chapter_text),
+            **kwargs,
+        )
+        return _parse_chapter_result(raw)

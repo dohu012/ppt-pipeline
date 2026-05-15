@@ -43,37 +43,43 @@ _KEYWORD_SYNONYMS: dict[str, list[str]] = {
     "thanks":   ["thanks", "致谢"],
 }
 
-# For each slide type, keywords to look for in placeholder names.
-# Used to dynamically match any template without hardcoded name mapping.
-_SLIDE_LAYOUT_NEEDS: dict[str, list[str]] = {
-    "title":         ["标题", "title", "副标题", "subtitle", "日期", "date", "author"],
-    "toc":           ["标题", "title", "内容", "body", "text"],
-    "section_title": ["标题", "title", "副标题", "subtitle"],
-    "bullets":       ["标题", "title", "正文", "body", "内容", "text"],
-    "figure":        ["标题", "title", "图片", "image", "图注", "caption"],
-    "table":         ["标题", "title", "表格", "table"],
-    "end":           ["致谢", "text", "正文", "content", "标题", "title"],
-}
-
-
 def _build_layout_map(prs: Presentation) -> dict[str, int]:
-    """Dynamically match each slide type to the best layout in the template."""
+    """Match each slide type to the best layout using name + shape analysis."""
     layouts = []
     for i, layout in enumerate(prs.slide_layouts):
-        ph_names = [ph.name for ph in layout.placeholders]
-        layouts.append({"idx": i, "name": layout.name, "phs": ph_names})
+        n_text = sum(1 for s in layout.shapes if s.has_text_frame)
+        name_lower = layout.name.lower()
+        layouts.append({
+            "idx": i, "name": layout.name, "n_text": n_text,
+            "is_cover":  any(kw in name_lower for kw in ["封面", "cover"]),
+            "is_end":    any(kw in name_lower for kw in ["尾页", "封底", "end"]),
+            "is_section": any(kw in name_lower for kw in ["章节", "section"]),
+            "is_blank":  any(kw in name_lower for kw in ["空白", "blank"]),
+        })
 
-    mapping: dict[str, int] = {}
-    for slide_type, needs in _SLIDE_LAYOUT_NEEDS.items():
-        best_idx = 0
-        best_score = -1
-        for ly in layouts:
-            score = sum(1 for kw in needs if any(kw in ph for ph in ly["phs"]))
-            # Tiebreaker: more placeholders = richer layout
-            if score > best_score or (score == best_score and len(ly["phs"]) > len(layouts[best_idx]["phs"])):
-                best_score = score
-                best_idx = ly["idx"]
-        mapping[slide_type] = best_idx
+    mapping = {}
+
+    # title → cover layout
+    cover = [ly for ly in layouts if ly["is_cover"]]
+    mapping["title"] = cover[0]["idx"] if cover else 0
+
+    # end → end/back-cover layout
+    end = [ly for ly in layouts if ly["is_end"]]
+    mapping["end"] = end[0]["idx"] if end else 0
+
+    # section_title → section layout
+    sec = [ly for ly in layouts if ly["is_section"]]
+    mapping["section_title"] = sec[0]["idx"] if sec else 0
+
+    # bullets/toc/figure/table → blank (or first with most text shapes)
+    blank = [ly for ly in layouts if ly["is_blank"]]
+    if blank:
+        fallback = blank[0]["idx"]
+    else:
+        layouts.sort(key=lambda x: x["n_text"], reverse=True)
+        fallback = layouts[0]["idx"]
+    for st in ("bullets", "toc", "figure", "table"):
+        mapping[st] = fallback
 
     print(f"  Layout mapping: { {k: layouts[v]['name'] for k, v in mapping.items()} }")
     return mapping
@@ -116,15 +122,11 @@ def _set_text(shape, text: str) -> None:
 
 
 def _find_placeholder(slide, keywords: list[str]):
-    """Find a placeholder shape on the slide by name keyword matching.
-
-    Each keyword is expanded with its Chinese/English synonyms automatically.
-    """
+    """Find a shape by name keyword matching (with Chinese/English synonyms)."""
     expanded = []
     for kw in keywords:
         expanded.append(kw)
         expanded.extend(_KEYWORD_SYNONYMS.get(kw, []))
-    # Remove duplicates while preserving order
     seen: set[str] = set()
     unique = []
     for kw in expanded:
@@ -133,12 +135,38 @@ def _find_placeholder(slide, keywords: list[str]):
             seen.add(kwl)
             unique.append(kwl)
 
-    for shape in slide.placeholders:
+    for shape in slide.shapes:
         name_lower = shape.name.lower()
         for kw in unique:
             if kw in name_lower:
                 return shape
     return None
+
+
+def _find_body_shape(slide):
+    """Find the best shape for body text on a slide.
+
+    1. Named body/content placeholder → use it
+    2. Largest text-bearing shape (excluding title) → use it
+    3. Fallback → create a text box
+    """
+    body = _find_placeholder(slide, ["body", "content", "text", "bullets", "items"])
+    if body:
+        return body
+
+    title = _find_placeholder(slide, ["title"])
+    candidates = []
+    for shape in slide.shapes:
+        if shape == title or not shape.has_text_frame:
+            continue
+        candidates.append((shape.width * shape.height, shape))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    txBox = slide.shapes.add_textbox(Inches(0.8), Inches(1.8), Inches(8.4), Inches(5))
+    return txBox
 
 
 def _add_bullet_paragraph(tf, text: str, level: int = 0, font_size: int = 14) -> None:
@@ -173,7 +201,7 @@ def _fill_toc(slide, content: dict) -> None:
 
     # Items list
     items = content.get("items", [])
-    body = _find_placeholder(slide, ["content", "body", "items", "text"])
+    body = _find_body_shape(slide)
     if body and body.has_text_frame:
         tf = body.text_frame
         tf.clear()
@@ -201,7 +229,7 @@ def _fill_bullets(slide, content: dict) -> None:
 
     # Bullet list
     bullets = content.get("bullets", [])
-    body = _find_placeholder(slide, ["body", "content", "text", "bullets"])
+    body = _find_body_shape(slide)
     if body and body.has_text_frame:
         tf = body.text_frame
         tf.clear()

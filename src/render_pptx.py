@@ -1,5 +1,6 @@
 """Phase 2: Render ppt_plan.json into a .pptx file using a template."""
 
+import copy
 import json
 from pathlib import Path
 
@@ -15,8 +16,6 @@ from pptx.util import Inches, Pt
 
 _LAYOUT_CACHE: dict[str, int] = {}
 
-# Fallback placeholder names for each layout type when template doesn't
-# use standard PowerPoint placeholder names.
 _PLACEHOLDER_FALLBACKS: dict[str, dict[str, str]] = {
     "title": {"title": "标题", "subtitle": "副标题", "author": "作者", "date": "日期"},
     "toc": {"title": "标题", "items": "内容"},
@@ -27,7 +26,6 @@ _PLACEHOLDER_FALLBACKS: dict[str, dict[str, str]] = {
     "end": {"text": "致谢"},
 }
 
-# English → Chinese synonyms for placeholder name matching
 _KEYWORD_SYNONYMS: dict[str, list[str]] = {
     "title":    ["title", "标题"],
     "subtitle": ["subtitle", "副标题"],
@@ -43,8 +41,9 @@ _KEYWORD_SYNONYMS: dict[str, list[str]] = {
     "thanks":   ["thanks", "致谢"],
 }
 
+
 def _build_layout_map(prs: Presentation) -> dict[str, int]:
-    """Match each slide type to the best layout using name + shape analysis."""
+    """Match slide types to layouts using name + shape analysis."""
     layouts = []
     for i, layout in enumerate(prs.slide_layouts):
         n_text = sum(1 for s in layout.shapes if s.has_text_frame)
@@ -58,20 +57,12 @@ def _build_layout_map(prs: Presentation) -> dict[str, int]:
         })
 
     mapping = {}
-
-    # title → cover layout
     cover = [ly for ly in layouts if ly["is_cover"]]
     mapping["title"] = cover[0]["idx"] if cover else 0
-
-    # end → end/back-cover layout
     end = [ly for ly in layouts if ly["is_end"]]
     mapping["end"] = end[0]["idx"] if end else 0
-
-    # section_title → section layout
     sec = [ly for ly in layouts if ly["is_section"]]
     mapping["section_title"] = sec[0]["idx"] if sec else 0
-
-    # bullets/toc/figure/table → blank (or first with most text shapes)
     blank = [ly for ly in layouts if ly["is_blank"]]
     if blank:
         fallback = blank[0]["idx"]
@@ -80,8 +71,6 @@ def _build_layout_map(prs: Presentation) -> dict[str, int]:
         fallback = layouts[0]["idx"]
     for st in ("bullets", "toc", "figure", "table"):
         mapping[st] = fallback
-
-    print(f"  Layout mapping: { {k: layouts[v]['name'] for k, v in mapping.items()} }")
     return mapping
 
 
@@ -90,21 +79,75 @@ def _find_layout_index(prs: Presentation, name: str) -> int:
     cache_key = f"{id(prs)}_{name}"
     if cache_key in _LAYOUT_CACHE:
         return _LAYOUT_CACHE[cache_key]
-
-    # Dynamic matching: build once per presentation
     dynamic_key = f"{id(prs)}_dynamic"
     if dynamic_key not in _LAYOUT_CACHE:
         layout_map = _build_layout_map(prs)
         for k, v in layout_map.items():
             _LAYOUT_CACHE[f"{id(prs)}_{k}"] = v
         _LAYOUT_CACHE[dynamic_key] = True
-
     if f"{id(prs)}_{name}" in _LAYOUT_CACHE:
         return _LAYOUT_CACHE[f"{id(prs)}_{name}"]
-
-    # Final fallback: first layout
     _LAYOUT_CACHE[cache_key] = 0
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Slide duplication
+# ---------------------------------------------------------------------------
+
+def _duplicate_slide(prs, source_slide):
+    """Deep-copy a slide with all shapes, preserving visual design."""
+    new_slide = prs.slides.add_slide(source_slide.slide_layout)
+
+    # Remove all shapes that came from the layout
+    sp_tree = new_slide.shapes._spTree
+    for child in list(sp_tree):
+        local_tag = child.tag.split("}")[-1]
+        if local_tag in ("sp", "pic", "graphicFrame", "grpSp", "cxnSp"):
+            sp_tree.remove(child)
+
+    # Deep-copy all visual elements from the source slide
+    for child in list(source_slide.shapes._spTree):
+        local_tag = child.tag.split("}")[-1]
+        if local_tag in ("sp", "pic", "graphicFrame", "grpSp", "cxnSp"):
+            sp_tree.append(copy.deepcopy(child))
+
+    # Copy image/object relationships from source
+    for rId, rel in source_slide.part.rels.items():
+        if rId not in new_slide.part.rels:
+            new_slide.part.rels._rels[rId] = rel
+
+    return new_slide
+
+
+def _clear_slide_text(slide):
+    """Clear all text from every text-bearing shape on a slide."""
+    for shape in slide.shapes:
+        if shape.has_text_frame:
+            tf = shape.text_frame
+            tf.clear()
+            tf.paragraphs[0].text = ""
+
+
+def _analyze_template_slides(prs):
+    """Categorize each template slide by purpose for smart mapping."""
+    info = []
+    for i, slide in enumerate(prs.slides):
+        layout_name = slide.slide_layout.name.lower()
+        text_shapes = []
+        for s in slide.shapes:
+            if s.has_text_frame and s.text_frame.text.strip():
+                text_shapes.append(s.text_frame.text.strip()[:60])
+        info.append({
+            "idx": i,
+            "layout": slide.slide_layout.name,
+            "n_text_shapes": len(text_shapes),
+            "texts": text_shapes,
+            "is_cover":  any(kw in layout_name for kw in ["封面", "cover"]),
+            "is_end":    any(kw in layout_name for kw in ["尾页", "封底", "end"]),
+            "is_section": any(kw in layout_name for kw in ["章节", "section"]),
+        })
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +155,7 @@ def _find_layout_index(prs: Presentation, name: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _set_text(shape, text: str) -> None:
-    """Write text into a shape, handling both auto-shapes and text frames."""
+    """Write text into a shape."""
     if shape.has_text_frame:
         tf = shape.text_frame
         tf.clear()
@@ -144,12 +187,7 @@ def _find_placeholder(slide, keywords: list[str]):
 
 
 def _find_body_shape(slide):
-    """Find the best shape for body text on a slide.
-
-    1. Named body/content placeholder → use it
-    2. Largest text-bearing shape (excluding title) → use it
-    3. Fallback → create a text box
-    """
+    """Find the best shape for body text on a slide."""
     body = _find_placeholder(slide, ["body", "content", "text", "bullets", "items"])
     if body:
         return body
@@ -194,12 +232,10 @@ def _fill_title(slide, content: dict) -> None:
 
 
 def _fill_toc(slide, content: dict) -> None:
-    # Title
     ph = _find_placeholder(slide, ["title"])
     if ph:
         _set_text(ph, content.get("title", "目录"))
 
-    # Items list
     items = content.get("items", [])
     body = _find_body_shape(slide)
     if body and body.has_text_frame:
@@ -222,12 +258,10 @@ def _fill_section_title(slide, content: dict) -> None:
 
 
 def _fill_bullets(slide, content: dict) -> None:
-    # Title
     ph = _find_placeholder(slide, ["title"])
     if ph:
         _set_text(ph, content.get("title", ""))
 
-    # Bullet list
     bullets = content.get("bullets", [])
     body = _find_body_shape(slide)
     if body and body.has_text_frame:
@@ -242,17 +276,14 @@ def _fill_bullets(slide, content: dict) -> None:
 
 
 def _fill_figure(slide, content: dict) -> None:
-    # Title
     ph = _find_placeholder(slide, ["title"])
     if ph:
         _set_text(ph, content.get("title", ""))
 
-    # Image
     img_path = content.get("image", "")
     if img_path and Path(img_path).exists():
         img_ph = _find_placeholder(slide, ["image", "picture", "图片", "img"])
         if img_ph:
-            # Replace placeholder with picture
             left = img_ph.left
             top = img_ph.top
             width = img_ph.width
@@ -261,16 +292,11 @@ def _fill_figure(slide, content: dict) -> None:
             sp.getparent().remove(sp)
             slide.shapes.add_picture(str(img_path), left, top, width, height)
         else:
-            # Just add picture centered on slide
             slide.shapes.add_picture(
                 str(img_path),
-                Inches(1.5),
-                Inches(2),
-                Inches(7),
-                Inches(4.5),
+                Inches(1.5), Inches(2), Inches(7), Inches(4.5),
             )
 
-    # Caption
     caption = content.get("caption", "")
     if caption:
         ph = _find_placeholder(slide, ["caption", "图注", "subtitle"])
@@ -279,14 +305,12 @@ def _fill_figure(slide, content: dict) -> None:
 
 
 def _fill_table(slide, content: dict) -> None:
-    # Title
     ph = _find_placeholder(slide, ["title"])
     if ph:
         _set_text(ph, content.get("title", ""))
 
     header = content.get("header", [])
     rows = content.get("rows", [])
-
     if not header or not rows:
         return
 
@@ -309,7 +333,6 @@ def _fill_table(slide, content: dict) -> None:
     table_shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
     table = table_shape.table
 
-    # Header row
     for ci, col_name in enumerate(header):
         cell = table.cell(0, ci)
         cell.text = col_name
@@ -319,7 +342,6 @@ def _fill_table(slide, content: dict) -> None:
                 run.font.size = Pt(12)
                 run.font.bold = True
 
-    # Data rows
     for ri, row in enumerate(rows):
         for ci, val in enumerate(row):
             if ci < n_cols:
@@ -354,6 +376,45 @@ _FILLERS = {
 
 
 # ---------------------------------------------------------------------------
+# Source slide selection
+# ---------------------------------------------------------------------------
+
+def _pick_source_idx(slide_type, tpl_info, usage_count):
+    """Pick a template slide index for the given plan slide type."""
+    # title → cover slide
+    if slide_type == "title":
+        for s in tpl_info:
+            if s["is_cover"]:
+                return s["idx"]
+        return 0
+
+    # end → closing slide
+    if slide_type == "end":
+        for s in tpl_info:
+            if s["is_end"]:
+                return s["idx"]
+        return tpl_info[-1]["idx"]
+
+    # section_title → section divider slide
+    if slide_type == "section_title":
+        for s in tpl_info:
+            if s["is_section"]:
+                return s["idx"]
+
+    # Content slides (bullets/toc/figure/table):
+    # Cycle through non-cover, non-end, non-section slides
+    content_slides = [
+        s for s in tpl_info
+        if not s["is_cover"] and not s["is_end"] and not s["is_section"]
+    ]
+    if content_slides:
+        return content_slides[usage_count % len(content_slides)]["idx"]
+
+    # Fallback
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main renderer
 # ---------------------------------------------------------------------------
 
@@ -364,13 +425,8 @@ def render(
 ) -> str:
     """Render ppt_plan.json into a .pptx file.
 
-    Args:
-        plan_path: Path to ppt_plan.json.
-        template_path: Path to the .pptx template with predefined layouts.
-        output_path: Where to write the final .pptx.
-
-    Returns:
-        The output file path as a string.
+    Preserves the template's slide design by duplicating original slides
+    instead of creating empty ones from layouts.
     """
     plan_path = Path(plan_path)
     template_path = Path(template_path)
@@ -384,16 +440,41 @@ def render(
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     prs = Presentation(str(template_path))
 
-    for slide_plan in plan["slides"]:
-        layout_name = slide_plan["layout"]
-        layout_idx = _find_layout_index(prs, layout_name)
-        slide = prs.slides.add_slide(prs.slide_layouts[layout_idx])
+    # Analyze the template's original slides
+    tpl_info = _analyze_template_slides(prs)
+    original_slides = list(prs.slides)  # keep references
+    n_originals = len(original_slides)
 
-        filler = _FILLERS.get(layout_name)
-        if filler:
-            filler(slide, slide_plan["content"])
-        else:
-            print(f"  [warn] Unknown layout '{layout_name}' — skipping content fill")
+    if n_originals == 0:
+        # No original slides — fall back to layout-based creation
+        for slide_plan in plan["slides"]:
+            layout_name = slide_plan["layout"]
+            layout_idx = _find_layout_index(prs, layout_name)
+            slide = prs.slides.add_slide(prs.slide_layouts[layout_idx])
+            filler = _FILLERS.get(layout_name)
+            if filler:
+                filler(slide, slide_plan["content"])
+    else:
+        # Duplicate from template slides, preserving their design
+        content_counter = 0
+        for slide_plan in plan["slides"]:
+            slide_type = slide_plan["layout"]
+            if slide_type in ("section_title", "bullets", "toc", "figure", "table"):
+                content_counter += 1
+            src_idx = _pick_source_idx(slide_type, tpl_info, content_counter)
+            src = original_slides[src_idx]
+            new_slide = _duplicate_slide(prs, src)
+            _clear_slide_text(new_slide)
+            filler = _FILLERS.get(slide_type)
+            if filler:
+                filler(new_slide, slide_plan["content"])
+
+        # Remove original template slides
+        sldIdLst = prs.slides._sldIdLst
+        for _ in range(n_originals):
+            rId = sldIdLst[0].rId
+            prs.part.drop_rel(rId)
+            sldIdLst.remove(sldIdLst[0])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(output_path))

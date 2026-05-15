@@ -27,6 +27,22 @@ _PLACEHOLDER_FALLBACKS: dict[str, dict[str, str]] = {
     "end": {"text": "致谢"},
 }
 
+# English → Chinese synonyms for placeholder name matching
+_KEYWORD_SYNONYMS: dict[str, list[str]] = {
+    "title":    ["title", "标题"],
+    "subtitle": ["subtitle", "副标题"],
+    "author":   ["author", "作者"],
+    "date":     ["date", "日期"],
+    "body":     ["body", "正文", "内容"],
+    "items":    ["items", "内容", "列表", "项目"],
+    "content":  ["content", "内容", "正文"],
+    "image":    ["image", "图片", "picture", "img"],
+    "caption":  ["caption", "图注", "subtitle"],
+    "table":    ["table", "表格"],
+    "text":     ["text", "文本", "文字", "正文", "内容"],
+    "thanks":   ["thanks", "致谢"],
+}
+
 # For each slide type, keywords to look for in placeholder names.
 # Used to dynamically match any template without hardcoded name mapping.
 _SLIDE_LAYOUT_NEEDS: dict[str, list[str]] = {
@@ -100,10 +116,26 @@ def _set_text(shape, text: str) -> None:
 
 
 def _find_placeholder(slide, keywords: list[str]):
-    """Find a placeholder shape on the slide by name keyword matching."""
+    """Find a placeholder shape on the slide by name keyword matching.
+
+    Each keyword is expanded with its Chinese/English synonyms automatically.
+    """
+    expanded = []
+    for kw in keywords:
+        expanded.append(kw)
+        expanded.extend(_KEYWORD_SYNONYMS.get(kw, []))
+    # Remove duplicates while preserving order
+    seen: set[str] = set()
+    unique = []
+    for kw in expanded:
+        kwl = kw.lower()
+        if kwl not in seen:
+            seen.add(kwl)
+            unique.append(kwl)
+
     for shape in slide.placeholders:
         name_lower = shape.name.lower()
-        for kw in keywords:
+        for kw in unique:
             if kw in name_lower:
                 return shape
     return None

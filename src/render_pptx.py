@@ -27,28 +27,62 @@ _PLACEHOLDER_FALLBACKS: dict[str, dict[str, str]] = {
     "end": {"text": "致谢"},
 }
 
+# For each slide type, keywords to look for in placeholder names.
+# Used to dynamically match any template without hardcoded name mapping.
+_SLIDE_LAYOUT_NEEDS: dict[str, list[str]] = {
+    "title":         ["标题", "title", "副标题", "subtitle", "日期", "date", "author"],
+    "toc":           ["标题", "title", "内容", "body", "text"],
+    "section_title": ["标题", "title", "副标题", "subtitle"],
+    "bullets":       ["标题", "title", "正文", "body", "内容", "text"],
+    "figure":        ["标题", "title", "图片", "image", "图注", "caption"],
+    "table":         ["标题", "title", "表格", "table"],
+    "end":           ["致谢", "text", "正文", "content", "标题", "title"],
+}
+
+
+def _build_layout_map(prs: Presentation) -> dict[str, int]:
+    """Dynamically match each slide type to the best layout in the template."""
+    layouts = []
+    for i, layout in enumerate(prs.slide_layouts):
+        ph_names = [ph.name for ph in layout.placeholders]
+        layouts.append({"idx": i, "name": layout.name, "phs": ph_names})
+
+    mapping: dict[str, int] = {}
+    for slide_type, needs in _SLIDE_LAYOUT_NEEDS.items():
+        best_idx = 0
+        best_score = -1
+        for ly in layouts:
+            score = sum(1 for kw in needs if any(kw in ph for ph in ly["phs"]))
+            # Tiebreaker: more placeholders = richer layout
+            if score > best_score or (score == best_score and len(ly["phs"]) > len(layouts[best_idx]["phs"])):
+                best_score = score
+                best_idx = ly["idx"]
+        mapping[slide_type] = best_idx
+
+    print(f"  Layout mapping: { {k: layouts[v]['name'] for k, v in mapping.items()} }")
+    return mapping
+
 
 def _find_layout_index(prs: Presentation, name: str) -> int:
-    """Find a slide layout by its name, with caching."""
+    """Find a slide layout by name, with dynamic fallback."""
     cache_key = f"{id(prs)}_{name}"
     if cache_key in _LAYOUT_CACHE:
         return _LAYOUT_CACHE[cache_key]
 
-    for i, layout in enumerate(prs.slide_layouts):
-        if layout.name == name:
-            _LAYOUT_CACHE[cache_key] = i
-            return i
+    # Dynamic matching: build once per presentation
+    dynamic_key = f"{id(prs)}_dynamic"
+    if dynamic_key not in _LAYOUT_CACHE:
+        layout_map = _build_layout_map(prs)
+        for k, v in layout_map.items():
+            _LAYOUT_CACHE[f"{id(prs)}_{k}"] = v
+        _LAYOUT_CACHE[dynamic_key] = True
 
-    # Fallback: try partial match
-    for i, layout in enumerate(prs.slide_layouts):
-        if name in layout.name or layout.name in name:
-            _LAYOUT_CACHE[cache_key] = i
-            return i
+    if f"{id(prs)}_{name}" in _LAYOUT_CACHE:
+        return _LAYOUT_CACHE[f"{id(prs)}_{name}"]
 
-    raise KeyError(
-        f"Layout '{name}' not found in template. "
-        f"Available layouts: {[ly.name for ly in prs.slide_layouts]}"
-    )
+    # Final fallback: first layout
+    _LAYOUT_CACHE[cache_key] = 0
+    return 0
 
 
 # ---------------------------------------------------------------------------

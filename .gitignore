@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# Pipeline input/output
+input/*.pdf
+output/figures/
+output/*.pptx
+output/ppt_plan.json
+
+# Keep directory structure
+!input/.gitkeep
+!output/.gitkeep
+!output/figures/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

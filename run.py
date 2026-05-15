@@ -17,8 +17,13 @@ Steps:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+# Load .env file before anything else
+from dotenv import load_dotenv
+load_dotenv()
 
 # Ensure src/ is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
@@ -28,89 +33,30 @@ from assemble_plan import assemble_plan
 from render_pptx import render
 
 
-def _map_chapter_visuals(
-    ch: dict,
-    figure_entries: list[dict],
-    table_entries: list[dict],
-    chapter_texts: dict[str, str],
-    llm_results: dict[str, dict],
-    provider: str,
-    model_kwargs: dict,
-) -> None:
-    """Recursively process a chapter tree, calling the LLM for each section
-    with the figures and tables that fall within its page range."""
-    from llm_summarize import summarize_chapter
-
-    for label, text in chapter_texts.items():
-        if not text.strip():
-            continue
-
-        # Find figures/tables belonging to this section
-        sec_figures, sec_tables = _find_visuals_for_section(
-            ch, label, figure_entries, table_entries
-        )
-
-        print(f"LLM: {label} ({len(text)} chars", end="")
-        if sec_figures:
-            print(f", {len(sec_figures)} figures", end="")
-        if sec_tables:
-            print(f", {len(sec_tables)} tables", end="")
-        print(")")
-
-        try:
-            result = summarize_chapter(
-                label, text,
-                figures=sec_figures or None,
-                tables=sec_tables or None,
-                provider=provider,
-                **model_kwargs,
-            )
-            llm_results[label] = result
-        except Exception as e:
-            print(f"  [warn] LLM call failed for '{label}': {e}")
-            continue
-
-
 def _find_visuals_for_section(
-    ch: dict,
-    label: str,
+    ch_num: str,
     figure_entries: list[dict],
     table_entries: list[dict],
 ) -> tuple[list[dict], list[dict]]:
-    """Return (figures, tables) whose doc_page falls within the section's page range."""
-    # Determine the section page range
-    if " / " in label:
-        sec_title = label.split(" / ", 1)[1]
-        # Find the subsection
-        for sec in ch.get("sections", []):
-            if sec["title"] == sec_title:
-                pg_start = sec["page_start"]
-                pg_end = sec["page_end"]
-                break
-        else:
-            pg_start = ch["page_start"]
-            pg_end = ch["page_end"]
-    else:
-        pg_start = ch["page_start"]
-        pg_end = ch["page_end"]
-
-    # offset: doc_page → pdf_0idx is handled inside parse_pdf (the screenshot
-    # filenames already point to the right pages).  We use doc_page + 14 ≈ pdf_0idx
-    # for a typical 15-page front-matter offset.
-    # Since we already have screenshots, we match by checking if the figure/table
-    # belongs to this chapter based on its number prefix (e.g. "图3-1" → chapter 3).
-    ch_num = _extract_chapter_number(ch["title"])
-
-    figs = [
-        {"number": f["number"], "caption": f["caption"], "screenshot": f.get("screenshot", "")}
-        for f in figure_entries
-        if f["number"].startswith(f"图{ch_num}-") or f["number"].startswith(f"图{ch_num}–")
-    ]
-    tabs = [
-        {"number": t["number"], "caption": t["caption"], "screenshot": t.get("screenshot", "")}
-        for t in table_entries
-        if t["number"].startswith(f"表{ch_num}-") or t["number"].startswith(f"表{ch_num}–")
-    ]
+    """Return (figures, tables) whose number prefix matches the chapter number."""
+    figs = []
+    for f in figure_entries:
+        num = f["number"]
+        if num.startswith(f"图{ch_num}-") or num.startswith(f"图{ch_num}–"):
+            figs.append({
+                "number": num,
+                "caption": f["caption"],
+                "screenshot": f.get("screenshot", ""),
+            })
+    tabs = []
+    for t in table_entries:
+        num = t["number"]
+        if num.startswith(f"表{ch_num}-") or num.startswith(f"表{ch_num}–"):
+            tabs.append({
+                "number": num,
+                "caption": t["caption"],
+                "screenshot": t.get("screenshot", ""),
+            })
     return figs, tabs
 
 
@@ -212,17 +158,49 @@ def main() -> None:
         model_kwargs = {}
         if args.model:
             model_kwargs["model"] = args.model
+        elif os.environ.get("PPT_MODEL"):
+            model_kwargs["model"] = os.environ["PPT_MODEL"]
 
         # Map figure/table entries to chapters by page range
         figure_entries = parsed_data.get("figure_entries", [])
         table_entries = parsed_data.get("table_entries", [])
         chapter_texts = parsed_data.get("chapter_texts", {})
 
-        for ch in parsed_data.get("chapters", []):
-            _map_chapter_visuals(
-                ch, figure_entries, table_entries, chapter_texts,
-                llm_results, args.llm, model_kwargs,
+        # Iterate over all chapter texts once (not per chapter)
+        for label, text in chapter_texts.items():
+            if not text.strip():
+                continue
+
+            # Find which chapter owns this label
+            ch_num = ""
+            for ch in parsed_data.get("chapters", []):
+                if label.startswith(ch["title"]) or label == ch["title"]:
+                    ch_num = _extract_chapter_number(ch["title"])
+                    break
+
+            sec_figures, sec_tables = _find_visuals_for_section(
+                ch_num, figure_entries, table_entries
             )
+
+            print(f"LLM: {label} ({len(text)} chars", end="")
+            if sec_figures:
+                print(f", {len(sec_figures)} figures", end="")
+            if sec_tables:
+                print(f", {len(sec_tables)} tables", end="")
+            print(")")
+
+            try:
+                result = summarize_chapter(
+                    label, text,
+                    figures=sec_figures or None,
+                    tables=sec_tables or None,
+                    provider=args.llm,
+                    **model_kwargs,
+                )
+                llm_results[label] = result
+            except Exception as e:
+                print(f"  [warn] LLM call failed for '{label}': {e}")
+                continue
 
     # ------------------------------------------------------------------
     # Step 3: Assemble ppt_plan.json

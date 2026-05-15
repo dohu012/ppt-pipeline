@@ -1,162 +1,90 @@
 """Generate a default template.pptx with all required slide layouts.
 
-This is a convenience utility so the pipeline works out-of-the-box without
-requiring the user to manually craft a template in PowerPoint.
+Repurposes the 7 built-in slide layouts that ship with a blank PowerPoint file.
 Users are encouraged to replace the generated template with their own design.
 """
 
 from pptx import Presentation
-from pptx.enum.text import PP_ALIGN
-from pptx.util import Inches, Pt
+from pptx.util import Inches
 
 
-def _add_placeholder(slide_layout, idx: int, name: str, left, top, width, height):
-    """Add a placeholder shape to a slide layout."""
-    # python-pptx doesn't expose a clean API for adding placeholders to
-    # slide layouts, so we work at the XML level.
-    from lxml import etree
+# Maps our layout names → built-in layout index in a default blank .pptx
+LAYOUT_MAP = {
+    "title":         0,   # Title Slide        → title + subtitle
+    "bullets":       1,   # Title and Content  → title + body
+    "section_title": 2,   # Section Header     → title + subtitle
+    "toc":           3,   # Two Content        → title + body (we rename one body)
+    "end":           5,   # Title Only         → just a text placeholder
+    "table":         7,   # Content + Caption  → title + body + caption
+    "figure":        8,   # Picture + Caption  → title + picture + caption
+}
 
-    NSMAP = {
-        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
-    }
 
-    sp_tree = slide_layout.element
-
-    # Find or create the cSld/spTree element
-    cSld = sp_tree.find(".//p:cSld", NSMAP)
-    if cSld is None:
-        cSld = etree.SubElement(
-            sp_tree,
-            "{http://schemas.openxmlformats.org/presentationml/2006/main}cSld",
-        )
-    spTree = cSld.find(".//p:spTree", NSMAP)
-    if spTree is None:
-        spTree = etree.SubElement(
-            cSld,
-            "{http://schemas.openxmlformats.org/presentationml/2006/main}spTree",
-        )
-
-    # Build a <p:sp> shape element
-    shape_elm = etree.SubElement(spTree, "{http://schemas.openxmlformats.org/presentationml/2006/main}sp")
-    shape_elm.set("useBgFill", "1")
-
-    nvSpPr = etree.SubElement(shape_elm, "{http://schemas.openxmlformats.org/presentationml/2006/main}nvSpPr")
-    cNvPr = etree.SubElement(nvSpPr, "{http://schemas.openxmlformats.org/presentationml/2006/main}cNvPr")
-    cNvPr.set("id", str(idx))
-    cNvPr.set("name", name)
-    cNvSpPr = etree.SubElement(nvSpPr, "{http://schemas.openxmlformats.org/presentationml/2006/main}cNvSpPr")
-    cNvSpPr.set("txBox", "1")
-    nvPr = etree.SubElement(nvSpPr, "{http://schemas.openxmlformats.org/presentationml/2006/main}nvPr")
-
-    # <p:spPr>
-    spPr = etree.SubElement(shape_elm, "{http://schemas.openxmlformats.org/presentationml/2006/main}spPr")
-    xfrm = etree.SubElement(spPr, "{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm")
-    off = etree.SubElement(xfrm, "{http://schemas.openxmlformats.org/drawingml/2006/main}off")
-    off.set("x", str(int(left)))
-    off.set("y", str(int(top)))
-    ext = etree.SubElement(xfrm, "{http://schemas.openxmlformats.org/drawingml/2006/main}ext")
-    ext.set("cx", str(int(width)))
-    ext.set("cy", str(int(height)))
-    prstGeom = etree.SubElement(spPr, "{http://schemas.openxmlformats.org/drawingml/2006/main}prstGeom")
-    prstGeom.set("prst", "rect")
-    avLst = etree.SubElement(prstGeom, "{http://schemas.openxmlformats.org/drawingml/2006/main}avLst")
-
-    # <p:txBody>
-    txBody = etree.SubElement(shape_elm, "{http://schemas.openxmlformats.org/presentationml/2006/main}txBody")
-    bodyPr = etree.SubElement(txBody, "{http://schemas.openxmlformats.org/drawingml/2006/main}bodyPr")
-    p_elm = etree.SubElement(txBody, "{http://schemas.openxmlformats.org/drawingml/2006/main}p")
-
-    return shape_elm
+def _rename_placeholders(layout, renames: dict[int, str]) -> None:
+    """Rename placeholders on a slide layout by their placeholder idx."""
+    for ph in layout.placeholders:
+        idx = ph.placeholder_format.idx
+        if idx in renames:
+            ph.name = renames[idx]
 
 
 def create_default_template(output_path: str = "template.pptx") -> str:
     """Generate a basic template.pptx with all 7 layout types.
 
-    Layout names follow the ppt_plan.json spec:
-    title, toc, section_title, bullets, figure, table, end
+    Layout names (matching ppt_plan.json): title, toc, section_title,
+    bullets, figure, table, end.
     """
     prs = Presentation()
 
-    # We want 16:9 slides
+    # 16:9 widescreen
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
-    def make_layout(name: str) -> None:
-        layout = prs.slide_layouts.add_new_layout()
-        layout.name = name
-        # The built-in blank layout has minimal decorations
-        return layout
+    # ---- title (built-in #0: Title Slide) ----
+    title_ly = prs.slide_layouts[0]
+    title_ly.name = "title"
+    _rename_placeholders(title_ly, {0: "title", 1: "subtitle", 11: "author"})
 
-    # ------------------------------------------------------------------
-    # title — 封面
-    # ------------------------------------------------------------------
-    title_layout = prs.slide_layouts[0]  # reuse the default title layout
-    title_layout.name = "title"
-    # Its default placeholders: title (idx 0), subtitle (idx 1)
-    # Rename placeholders for clarity
-    for ph in title_layout.placeholders:
-        if ph.placeholder_format.idx == 0:
-            ph.name = "title"
-        elif ph.placeholder_format.idx == 1:
-            ph.name = "subtitle"
+    # ---- bullets (built-in #1: Title and Content) ----
+    bullets_ly = prs.slide_layouts[1]
+    bullets_ly.name = "bullets"
+    _rename_placeholders(bullets_ly, {0: "title", 1: "body"})
 
-    # ------------------------------------------------------------------
-    # toc — 目录
-    # ------------------------------------------------------------------
-    toc_layout = prs.slide_layouts.add_new_layout()
-    toc_layout.name = "toc"
-    _add_placeholder(toc_layout, 0, "title", Inches(1), Inches(0.5), Inches(11), Inches(1))
-    _add_placeholder(toc_layout, 1, "content", Inches(2), Inches(2), Inches(9), Inches(4.5))
+    # ---- section_title (built-in #2: Section Header) ----
+    sec_ly = prs.slide_layouts[2]
+    sec_ly.name = "section_title"
+    _rename_placeholders(sec_ly, {0: "title", 1: "subtitle"})
 
-    # ------------------------------------------------------------------
-    # section_title — 章节过渡页
-    # ------------------------------------------------------------------
-    sec_layout = prs.slide_layouts.add_new_layout()
-    sec_layout.name = "section_title"
-    _add_placeholder(sec_layout, 0, "title", Inches(1), Inches(2.5), Inches(11), Inches(1.5))
-    _add_placeholder(sec_layout, 1, "subtitle", Inches(1.5), Inches(4.2), Inches(10), Inches(1))
+    # ---- toc (built-in #3: Two Content) ----
+    toc_ly = prs.slide_layouts[3]
+    toc_ly.name = "toc"
+    _rename_placeholders(toc_ly, {0: "title", 1: "content"})
 
-    # ------------------------------------------------------------------
-    # bullets — 正文内容
-    # ------------------------------------------------------------------
-    bullets_layout = prs.slide_layouts.add_new_layout()
-    bullets_layout.name = "bullets"
-    _add_placeholder(bullets_layout, 0, "title", Inches(0.8), Inches(0.4), Inches(11), Inches(0.9))
-    _add_placeholder(bullets_layout, 1, "body", Inches(1.2), Inches(1.6), Inches(10), Inches(5.2))
+    # ---- end (built-in #5: Title Only) ----
+    end_ly = prs.slide_layouts[5]
+    end_ly.name = "end"
+    _rename_placeholders(end_ly, {0: "text"})
 
-    # ------------------------------------------------------------------
-    # figure — 图表展示
-    # ------------------------------------------------------------------
-    figure_layout = prs.slide_layouts.add_new_layout()
-    figure_layout.name = "figure"
-    _add_placeholder(figure_layout, 0, "title", Inches(0.8), Inches(0.4), Inches(11), Inches(0.9))
-    _add_placeholder(figure_layout, 1, "image", Inches(1), Inches(1.5), Inches(11), Inches(5))
-    _add_placeholder(figure_layout, 2, "caption", Inches(1), Inches(6.7), Inches(11), Inches(0.6))
+    # ---- table (built-in #7: Content with Caption) ----
+    table_ly = prs.slide_layouts[7]
+    table_ly.name = "table"
+    _rename_placeholders(table_ly, {0: "title", 1: "table"})
 
-    # ------------------------------------------------------------------
-    # table — 数据对比
-    # ------------------------------------------------------------------
-    table_layout = prs.slide_layouts.add_new_layout()
-    table_layout.name = "table"
-    _add_placeholder(table_layout, 0, "title", Inches(0.8), Inches(0.4), Inches(11), Inches(0.9))
-    _add_placeholder(table_layout, 1, "table", Inches(0.8), Inches(1.6), Inches(11.5), Inches(5.5))
+    # ---- figure (built-in #8: Picture with Caption) ----
+    figure_ly = prs.slide_layouts[8]
+    figure_ly.name = "figure"
+    _rename_placeholders(figure_ly, {0: "title", 1: "image", 2: "caption"})
 
-    # ------------------------------------------------------------------
-    # end — 结尾页
-    # ------------------------------------------------------------------
-    end_layout = prs.slide_layouts.add_new_layout()
-    end_layout.name = "end"
-    _add_placeholder(end_layout, 0, "text", Inches(2), Inches(3), Inches(9), Inches(1.5))
+    # Hide the unused built-in layouts by appending "(unused)" to their names
+    unused = set(range(len(prs.slide_layouts))) - set(LAYOUT_MAP.values())
+    for idx in unused:
+        ly = prs.slide_layouts[idx]
+        if not ly.name.endswith("(unused)"):
+            ly.name = f"{ly.name} (unused)"
 
     prs.save(output_path)
     return output_path
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
@@ -164,3 +92,4 @@ if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "template.pptx"
     create_default_template(out)
     print(f"Default template created → {out}")
+    print("Layouts:", [ly.name for ly in Presentation(out).slide_layouts])

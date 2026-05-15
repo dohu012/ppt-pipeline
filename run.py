@@ -18,7 +18,9 @@ Steps:
 import argparse
 import json
 import os
+import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Load .env file before anything else
@@ -161,12 +163,12 @@ def main() -> None:
         elif os.environ.get("PPT_MODEL"):
             model_kwargs["model"] = os.environ["PPT_MODEL"]
 
-        # Map figure/table entries to chapters by page range
+        # Prepare tasks: skip short entries (< 300 chars), send rest to LLM
         figure_entries = parsed_data.get("figure_entries", [])
         table_entries = parsed_data.get("table_entries", [])
         chapter_texts = parsed_data.get("chapter_texts", {})
 
-        # Iterate over all chapter texts once (not per chapter)
+        tasks: list[tuple[str, str, list[dict], list[dict]]] = []
         for label, text in chapter_texts.items():
             if not text.strip():
                 continue
@@ -182,25 +184,40 @@ def main() -> None:
                 ch_num, figure_entries, table_entries
             )
 
-            print(f"LLM: {label} ({len(text)} chars", end="")
-            if sec_figures:
-                print(f", {len(sec_figures)} figures", end="")
-            if sec_tables:
-                print(f", {len(sec_tables)} tables", end="")
-            print(")")
-
-            try:
-                result = summarize_chapter(
-                    label, text,
-                    figures=sec_figures or None,
-                    tables=sec_tables or None,
-                    provider=args.llm,
-                    **model_kwargs,
-                )
-                llm_results[label] = result
-            except Exception as e:
-                print(f"  [warn] LLM call failed for '{label}': {e}")
+            # Short text: skip LLM, use rule-based bullets directly
+            if len(text.strip()) < 300:
+                sentences = [s.strip() for s in re.split(r"[。！？\n]", text) if len(s.strip()) > 10]
+                bullets = [{"bullet": s[:25], "ref_page": 0} for s in sentences[:3]]
+                llm_results[label] = {"bullets": bullets, "figures": [], "tables": []}
                 continue
+
+            tasks.append((label, text, sec_figures, sec_tables))
+
+        # Process remaining tasks in parallel
+        total = len(tasks)
+        if total:
+            print(f"LLM: processing {total} sections (max_workers=5)...")
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_map = {
+                    executor.submit(
+                        summarize_chapter, label, text,
+                        figures=sec_figures or None,
+                        tables=sec_tables or None,
+                        provider=args.llm,
+                        **model_kwargs,
+                    ): label
+                    for label, text, sec_figures, sec_tables in tasks
+                }
+
+                for done, future in enumerate(as_completed(future_map), 1):
+                    label = future_map[future]
+                    try:
+                        llm_results[label] = future.result()
+                    except Exception as e:
+                        print(f"  [{done}/{total}] ✗ {label}: {e}")
+                        continue
+                    sec_count = len(llm_results[label].get("bullets", []))
+                    print(f"  [{done}/{total}] {label} ({sec_count} bullets)")
 
     # ------------------------------------------------------------------
     # Step 3: Assemble ppt_plan.json
